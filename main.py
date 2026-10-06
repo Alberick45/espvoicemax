@@ -7,6 +7,7 @@ import time
 import wave
 
 import httpx
+import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 
 # ---------- Config (Set these as Render environment variables) ----------
@@ -19,7 +20,7 @@ WEBHOOK_URL  = os.getenv("WEBHOOK_URL", "")                   # optional: POST e
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 MIN_SECONDS = 0.4                                              # ignore blips shorter than this
 MAX_SECONDS = 30                                               # safety cap per utterance
-DEFAULT_RATE = 8000
+DEFAULT_RATE = 16000                                           # 16 kHz native Whisper rate
 
 # Whisper tends to invent these on near-silence
 HALLUCINATIONS = {"thank you.", "thanks for watching!", "you", "bye.", "."}
@@ -27,6 +28,18 @@ HALLUCINATIONS = {"thank you.", "thanks for watching!", "you", "bye.", "."}
 app = FastAPI(title="ESP32 Voice-to-Text Server")
 http = httpx.AsyncClient(timeout=30)
 app_clients: set[WebSocket] = set()                            # live app clients listening for transcripts
+
+
+# ---------- Audio Cleaning & Normalization ----------
+def clean_pcm(pcm: bytes) -> bytes:
+    x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+    if x.size == 0:
+        return pcm
+    x -= x.mean()
+    loud = np.percentile(np.abs(x), 99.5)
+    if loud > 1:
+        x *= min(0.8 * 32767 / loud, 20)        # normalise volume, capped gain
+    return np.clip(x, -32768, 32767).astype(np.int16).tobytes()
 
 
 # ---------- Swappable STT (Replace this function for local Raspberry Pi Whisper) ----------
@@ -96,7 +109,7 @@ async def handle_utterance(ws: WebSocket, device: str, pcm: bytes, rate: int):
         return
     try:
         await ws.send_json({"type": "status", "text": "thinking"})
-        text = await transcribe(pcm_to_wav(pcm, rate))
+        text = await transcribe(pcm_to_wav(clean_pcm(pcm), rate))
         if text.lower() in HALLUCINATIONS:
             text = ""
         out = format_output(text, device)
